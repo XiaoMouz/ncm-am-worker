@@ -8,13 +8,8 @@ compatibility_flags = ["nodejs_compat"]
 crons = ["10 22 * * *"]  # UTC 22:10 = 北京时间 06:10
 
 # ── KV namespace ──
-# 创建: wrangler kv namespace create CONFIG
-#       wrangler kv namespace create STATE
+# 创建: wrangler kv namespace create NCM_AM
 # 把输出的 ID 填入下方
 [[kv_namespaces]]
-binding = "CONFIG"
-id = "YOUR_CONFIG_KV_ID"
-
-[[kv_namespaces]]
-binding = "STATE"
-id = "YOUR_STATE_KV_ID"
+binding = "KV"
+id = "YOUR_KV_ID"

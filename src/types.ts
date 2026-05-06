@@ -1,7 +1,6 @@
 export interface Env {
-  // KV
-  CONFIG: KVNamespace;
-  STATE: KVNamespace;
+  // KV (single namespace)
+  KV: KVNamespace;
 
   // Secrets (set via wrangler secret)
   NCM_COOKIE: string;             // MUSIC_U=xxx; __csrf=yyy (initial, auto-refreshed)
