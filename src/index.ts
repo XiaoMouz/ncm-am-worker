@@ -1,191 +1,308 @@
-     1|import type { Env } from './types';
-     2|import { sync, formatResult } from './sync';
-     3|import {
-     4|  checkLogin,
-     5|  refreshLoginRaw,
-     6|  qrLoginCreateKey,
-     7|  qrLoginUrl,
-     8|  qrLoginCheck,
-     9|} from './ncm';
-    10|
-    11|const corsHeaders = {
-    12|  'Access-Control-Allow-Origin': '*',
-    13|  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    14|  'Access-Control-Allow-Headers': 'Content-Type',
-    15|};
-    16|
-    17|function json(data: unknown, status = 200) {
-    18|  return Response.json(data, { status, headers: corsHeaders });
-    19|}
-    20|
-    21|export default {
-    22|  // ── Cron trigger ──
-    23|  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    24|    console.log(`[${new Date().toISOString()}] NCM→AM sync triggered by cron`);
-    25|    const result = await sync(env);
-    26|    const text = formatResult(result);
-    27|    console.log(text);
-    28|
-    29|    // Save result to KV
-    30|    await env.KV.put('last_sync', JSON.stringify(result), {
-    31|      expirationTtl: 86400 * 4,
-    32|    });
-    33|    await env.KV.put('last_sync_text', text, {
-    34|      expirationTtl: 86400 * 4,
-    35|    });
-    36|  },
-    37|
-    38|  // ── HTTP handler ──
-    39|  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    40|    const url = new URL(request.url);
-    41|    const path = url.pathname;
-    42|
-    43|    // CORS preflight
-    44|    if (request.method === 'OPTIONS') {
-    45|      return new Response(null, { headers: corsHeaders });
-    46|    }
-    47|
-    48|    // ── GET / ──
-    49|    if (path === '/' && request.method === 'GET') {
-    50|      return json({
-    51|        service: 'ncm-am-worker',
-    52|        endpoints: {
-    53|          'GET  /status':      'NCM 登录状态 + 最近同步结果',
-    54|          'POST /sync':        '手动触发同步',
-    55|          'GET  /login':       '获取 QR 登录 URL',
-    56|          'GET  /login/check': '轮询 QR 扫码状态 (query: key=xxx)',
-    57|        },
-    58|      });
-    59|    }
-    60|
-    61|    // ── GET /status ──
-    62|    if (path === '/status' && request.method === 'GET') {
-    63|      // Check NCM login
-    64|      let cookie = env.NCM_COOKIE;
-    65|      let savedCookie = await env.KV.get('ncm_cookie');
-    66|      if (savedCookie) cookie = savedCookie;
-    67|
-    68|      let ncmStatus: { ok: boolean; uid?: string; nickname?: string; error?: string };
-    69|      try {
-    70|        ncmStatus = await checkLogin(cookie);
-    71|      } catch (e: any) {
-    72|        ncmStatus = { ok: false, error: e.message };
-    73|      }
-    74|
-    75|      // Try refresh if not ok
-    76|      let refreshed = false;
-    77|      if (!ncmStatus.ok) {
-    78|        const newCookie = await refreshLoginRaw(cookie);
-    79|        if (newCookie) {
-    80|          const recheck = await checkLogin(newCookie);
-    81|          if (recheck.ok) {
-    82|            await env.KV.put('ncm_cookie', newCookie, { expirationTtl: 86400 * 60 });
-    83|            ncmStatus = recheck;
-    84|            refreshed = true;
-    85|          }
-    86|        }
-    87|      }
-    88|
-    89|      const lastSync = await env.KV.get('last_sync_text');
-    90|
-    91|      return json({
-    92|        ncm: {
-    93|          ...ncmStatus,
-    94|          refreshed,
-    95|          message: ncmStatus.ok
-    96|            ? `✅ 登录正常 (${ncmStatus.nickname || ncmStatus.uid})`
-    97|            : `❌ 登录已过期，请访问 /login 重新扫码`,
-    98|        },
-    99|        lastSync: lastSync || null,
-   100|      });
-   101|    }
-   102|
-   103|    // ── GET /login ──
-   104|    // Start QR login flow: generate key, return QR URL
-   105|    if (path === '/login' && request.method === 'GET') {
-   106|      try {
-   107|        const key = await qrLoginCreateKey();
-   108|        const url = qrLoginUrl(key);
-   109|
-   110|        // Save key to KV for polling
-   111|        await env.KV.put(`qr_key:${key}`, 'pending', { expirationTtl: 300 });
-   112|
-   113|        return json({
-   114|          ok: true,
-   115|          key,
-   116|          qrUrl: url,
-   117|          instructions: [
-   118|            '1. 用网易云音乐 App 扫描 qrUrl 中的二维码',
-   119|            '2. 在 App 中确认登录',
-   120|            `3. 访问 GET /login/check?key=${key} 查看状态`,
-   121|            '4. 状态变为 803 表示成功，cookie 自动保存',
-   122|          ],
-   123|        });
-   124|      } catch (e: any) {
-   125|        return json({ ok: false, error: e.message }, 500);
-   126|      }
-   127|    }
-   128|
-   129|    // ── GET /login/check?key=xxx ──
-   130|    // Poll QR login status
-   131|    if (path === '/login/check' && request.method === 'GET') {
-   132|      const key = url.searchParams.get('key');
-   133|      if (!key) {
-   134|        return json({ error: 'Missing ?key= parameter' }, 400);
-   135|      }
-   136|
-   137|      try {
-   138|        const result = await qrLoginCheck(key);
-   139|
-   140|        // 803 = success
-   141|        if (result.code === 803 && result.cookie) {
-   142|          // Save new cookie
-   143|          await env.KV.put('ncm_cookie', result.cookie, { expirationTtl: 86400 * 60 });
-   144|          // Clean up QR key
-   145|          await env.KV.delete(`qr_key:${key}`);
-   146|
-   147|          // Verify the new cookie works
-   148|          const status = await checkLogin(result.cookie);
-   149|
-   150|          return json({
-   151|            code: 803,
-   152|            status: 'success',
-   153|            message: '✅ 登录成功，cookie 已保存',
-   154|            user: status.ok ? { uid: status.uid, nickname: status.nickname } : null,
-   155|          });
-   156|        }
-   157|
-   158|        // Map status codes
-   159|        const statusMap: Record<number, string> = {
-   160|          800: '❌ 二维码已过期，请重新访问 /login',
-   161|          801: '⏳ 等待扫码...',
-   162|          802: '⏳ 已扫码，等待确认...',
-   163|        };
-   164|
-   165|        return json({
-   166|          code: result.code,
-   167|          status: statusMap[result.code] || `未知状态: ${result.code}`,
-   168|          message: result.message,
-   169|        });
-   170|      } catch (e: any) {
-   171|        return json({ ok: false, error: e.message }, 500);
-   172|      }
-   173|    }
-   174|
-   175|    // ── POST /sync ──
-   176|    if (path === '/sync' && request.method === 'POST') {
-   177|      try {
-   178|        const result = await sync(env);
-   179|        const text = formatResult(result);
-   180|        await env.KV.put('last_sync', JSON.stringify(result), { expirationTtl: 86400 * 4 });
-   181|        await env.KV.put('last_sync_text', text, { expirationTtl: 86400 * 4 });
-   182|        return json(result);
-   183|      } catch (e: any) {
-   184|        return json({ error: e.message }, 500);
-   185|      }
-   186|    }
-   187|
-   188|    return json({ error: 'Not found' }, 404);
-   189|  },
-   190|};
-   191|
+import type { Env } from './types';
+import { sync, formatResult } from './sync';
+import {
+  checkLogin,
+  refreshLoginRaw,
+  qrLoginCreateKey,
+  qrLoginUrl,
+  qrLoginCheck,
+} from './ncm';
+import { generateVapidKeys, sendPushNotification } from './web-push';
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
+};
+
+function json(data: unknown, status = 200) {
+  return Response.json(data, { status, headers: corsHeaders });
+}
+
+/**
+ * Get or create VAPID keys, stored in KV
+ */
+async function getVapidKeys(env: Env): Promise<{ publicKey: string; privateKey: string }> {
+  const existing = await env.KV.get('vapid_keys', 'json');
+  if (existing) return existing as { publicKey: string; privateKey: string };
+
+  const keys = await generateVapidKeys();
+  await env.KV.put('vapid_keys', JSON.stringify(keys));
+  return keys;
+}
+
+/**
+ * Send push to all subscribers
+ */
+async function notifySubscribers(
+  env: Env,
+  title: string,
+  body: string,
+  type: 'success' | 'error',
+) {
+  const vapidKeys = await getVapidKeys(env);
+  const subsRaw = await env.KV.get('push_subscriptions', 'json');
+  const subs: { endpoint: string; keys: { p256dh: string; auth: string } }[] =
+    (subsRaw as any[]) || [];
+
+  const payload = JSON.stringify({
+    title,
+    body,
+    type,
+    tag: 'ncm-am-sync',
+    url: '/status',
+  });
+
+  const expired: string[] = [];
+  for (const sub of subs) {
+    const ok = await sendPushNotification(sub, payload, vapidKeys.publicKey, vapidKeys.privateKey);
+    if (!ok) expired.push(sub.endpoint);
+  }
+
+  // Remove expired subscriptions
+  if (expired.length > 0) {
+    const remaining = subs.filter((s) => !expired.includes(s.endpoint));
+    await env.KV.put('push_subscriptions', JSON.stringify(remaining));
+  }
+}
+
+export default {
+  // ── Cron trigger ──
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    console.log(`[${new Date().toISOString()}] NCM→AM sync triggered by cron`);
+    const result = await sync(env);
+    const text = formatResult(result);
+    console.log(text);
+
+    await env.KV.put('last_sync', JSON.stringify(result), { expirationTtl: 86400 * 4 });
+    await env.KV.put('last_sync_text', text, { expirationTtl: 86400 * 4 });
+
+    // Push notification
+    if (result.errors.length === 0 && result.found > 0) {
+      await notifySubscribers(
+        env,
+        '🎵 同步完成',
+        `${result.date}: ${result.found}/${result.total} 首已同步`,
+        'success',
+      );
+    } else {
+      await notifySubscribers(
+        env,
+        '⚠️ 同步异常',
+        `${result.date}: ${result.found}/${result.total} 首, ${result.errors.length} 个错误`,
+        'error',
+      );
+    }
+  },
+
+  // ── HTTP handler ──
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { headers: corsHeaders });
+    }
+
+    // ── GET / ──
+    if (path === '/' && request.method === 'GET') {
+      return json({
+        service: 'ncm-am-worker',
+        endpoints: {
+          'GET  /':            '本页',
+          'GET  /status':      'NCM 登录状态 + 最近同步结果',
+          'POST /sync':        '手动触发同步',
+          'GET  /login':       '获取 QR 登录 URL',
+          'GET  /login/check': '轮询 QR 扫码状态',
+          'GET  /subscribe':   '订阅推送通知页面',
+          'POST /subscribe':   '保存推送订阅',
+          'GET  /vapid-key':   '获取 VAPID 公钥',
+        },
+      });
+    }
+
+    // ── GET /subscribe ── (serve HTML page)
+    if (path === '/subscribe' && request.method === 'GET') {
+      const vapidKeys = await getVapidKeys(env);
+      let html = await fetch(new URL('../public/subscribe.html', import.meta.url).toString()).then(r => r.text());
+      html = html.replace('{{VAPID_PUBLIC_KEY}}', vapidKeys.publicKey);
+      return new Response(html, {
+        headers: { 'Content-Type': 'text/html; charset=utf-8', ...corsHeaders },
+      });
+    }
+
+    // ── GET /sw.js ── (service worker)
+    if (path === '/sw.js') {
+      const sw = await fetch(new URL('../public/sw.js', import.meta.url).toString()).then(r => r.text());
+      return new Response(sw, {
+        headers: { 'Content-Type': 'application/javascript', ...corsHeaders },
+      });
+    }
+
+    // ── GET /vapid-key ──
+    if (path === '/vapid-key' && request.method === 'GET') {
+      const keys = await getVapidKeys(env);
+      return json({ publicKey: keys.publicKey });
+    }
+
+    // ── POST /subscribe ── (save push subscription)
+    if (path === '/subscribe' && request.method === 'POST') {
+      try {
+        const sub = await request.json() as any;
+        if (!sub?.endpoint || !sub?.keys?.p256dh || !sub?.keys?.auth) {
+          return json({ error: 'Invalid subscription' }, 400);
+        }
+
+        // Get existing subscriptions
+        const existing: any[] = ((await env.KV.get('push_subscriptions', 'json')) as any[]) || [];
+
+        // Deduplicate by endpoint
+        const filtered = existing.filter((s) => s.endpoint !== sub.endpoint);
+        filtered.push({ endpoint: sub.endpoint, keys: sub.keys });
+
+        await env.KV.put('push_subscriptions', JSON.stringify(filtered));
+        return json({ ok: true, count: filtered.length });
+      } catch (e: any) {
+        return json({ error: e.message }, 500);
+      }
+    }
+
+    // ── DELETE /subscribe ── (unsubscribe)
+    if (path === '/subscribe' && request.method === 'DELETE') {
+      try {
+        const { endpoint } = await request.json() as any;
+        const existing: any[] = ((await env.KV.get('push_subscriptions', 'json')) as any[]) || [];
+        const filtered = existing.filter((s) => s.endpoint !== endpoint);
+        await env.KV.put('push_subscriptions', JSON.stringify(filtered));
+        return json({ ok: true, count: filtered.length });
+      } catch (e: any) {
+        return json({ error: e.message }, 500);
+      }
+    }
+
+    // ── GET /status ──
+    if (path === '/status' && request.method === 'GET') {
+      let cookie = env.NCM_COOKIE;
+      let savedCookie = await env.KV.get('ncm_cookie');
+      if (savedCookie) cookie = savedCookie;
+
+      let ncmStatus: { ok: boolean; uid?: string; nickname?: string; error?: string };
+      try {
+        ncmStatus = await checkLogin(cookie);
+      } catch (e: any) {
+        ncmStatus = { ok: false, error: e.message };
+      }
+
+      let refreshed = false;
+      if (!ncmStatus.ok) {
+        const newCookie = await refreshLoginRaw(cookie);
+        if (newCookie) {
+          const recheck = await checkLogin(newCookie);
+          if (recheck.ok) {
+            await env.KV.put('ncm_cookie', newCookie, { expirationTtl: 86400 * 60 });
+            ncmStatus = recheck;
+            refreshed = true;
+          }
+        }
+      }
+
+      const lastSync = await env.KV.get('last_sync_text');
+      const subs: any[] = ((await env.KV.get('push_subscriptions', 'json')) as any[]) || [];
+
+      return json({
+        ncm: {
+          ...ncmStatus,
+          refreshed,
+          message: ncmStatus.ok
+            ? `✅ 登录正常 (${ncmStatus.nickname || ncmStatus.uid})`
+            : `❌ 登录已过期，请访问 /login 重新扫码`,
+        },
+        push: { subscribers: subs.length },
+        lastSync: lastSync || null,
+      });
+    }
+
+    // ── GET /login ──
+    if (path === '/login' && request.method === 'GET') {
+      try {
+        const key = await qrLoginCreateKey();
+        const qrUrl = qrLoginUrl(key);
+        await env.KV.put(`qr_key:${key}`, 'pending', { expirationTtl: 300 });
+
+        return json({
+          ok: true,
+          key,
+          qrUrl,
+          instructions: [
+            '1. 用网易云音乐 App 扫描 qrUrl 中的二维码',
+            '2. 在 App 中确认登录',
+            `3. 访问 GET /login/check?key=${key} 查看状态`,
+            '4. 状态变为 803 表示成功，cookie 自动保存',
+          ],
+        });
+      } catch (e: any) {
+        return json({ ok: false, error: e.message }, 500);
+      }
+    }
+
+    // ── GET /login/check?key=xxx ──
+    if (path === '/login/check' && request.method === 'GET') {
+      const key = url.searchParams.get('key');
+      if (!key) return json({ error: 'Missing ?key= parameter' }, 400);
+
+      try {
+        const result = await qrLoginCheck(key);
+
+        if (result.code === 803 && result.cookie) {
+          await env.KV.put('ncm_cookie', result.cookie, { expirationTtl: 86400 * 60 });
+          await env.KV.delete(`qr_key:${key}`);
+
+          const status = await checkLogin(result.cookie);
+          return json({
+            code: 803,
+            status: 'success',
+            message: '✅ 登录成功，cookie 已保存',
+            user: status.ok ? { uid: status.uid, nickname: status.nickname } : null,
+          });
+        }
+
+        const statusMap: Record<number, string> = {
+          800: '❌ 二维码已过期，请重新访问 /login',
+          801: '⏳ 等待扫码...',
+          802: '⏳ 已扫码，等待确认...',
+        };
+
+        return json({
+          code: result.code,
+          status: statusMap[result.code] || `未知状态: ${result.code}`,
+          message: result.message,
+        });
+      } catch (e: any) {
+        return json({ ok: false, error: e.message }, 500);
+      }
+    }
+
+    // ── POST /sync ──
+    if (path === '/sync' && request.method === 'POST') {
+      try {
+        const result = await sync(env);
+        const text = formatResult(result);
+        await env.KV.put('last_sync', JSON.stringify(result), { expirationTtl: 86400 * 4 });
+        await env.KV.put('last_sync_text', text, { expirationTtl: 86400 * 4 });
+
+        // Push notification
+        if (result.errors.length === 0 && result.found > 0) {
+          await notifySubscribers(env, '🎵 同步完成', `${result.date}: ${result.found}/${result.total} 首`, 'success');
+        } else {
+          await notifySubscribers(env, '⚠️ 同步异常', `${result.date}: ${result.found}/${result.total}, ${result.errors.length} 错误`, 'error');
+        }
+
+        return json(result);
+      } catch (e: any) {
+        return json({ error: e.message }, 500);
+      }
+    }
+
+    return json({ error: 'Not found' }, 404);
+  },
+};
