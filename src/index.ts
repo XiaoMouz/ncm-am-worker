@@ -1,5 +1,5 @@
 import type { Env } from './types';
-import { sync, formatResult } from './sync';
+import { syncPhase1, syncPhase2, formatResult } from './sync';
 import {
   checkLogin,
   refreshLoginRaw,
@@ -70,8 +70,23 @@ async function notifySubscribers(
 export default {
   // ── Cron trigger ──
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    console.log(`[${new Date().toISOString()}] NCM→AM sync triggered by cron`);
-    const result = await sync(env);
+    console.log(`[${new Date().toISOString()}] NCM→AM sync triggered by cron (Phase 1)`);
+    // Phase 1 has no self URL in cron context — use env.SELF_URL or construct from KV
+    // In cron context we can't self-fetch, so run Phase 1 then Phase 2 sequentially
+    const phase1Result = await syncPhase1(env);
+    let result;
+    if (phase1Result.errors.length === 0) {
+      const phase2Result = await syncPhase2(env);
+      // Merge
+      result = { ...phase1Result };
+      result.playlistId = phase2Result.playlistId;
+      result.deletedPlaylists = phase2Result.deletedPlaylists;
+      if (phase2Result.errors.length > 0) {
+        result.errors.push(...phase2Result.errors);
+      }
+    } else {
+      result = phase1Result;
+    }
     const text = formatResult(result);
     console.log(text);
 
@@ -112,7 +127,7 @@ export default {
         endpoints: {
           'GET  /':            '本页',
           'GET  /status':      'NCM 登录状态 + 最近同步结果',
-          'POST /sync':        '手动触发同步',
+          'GET  /sync':        '手动触发同步 (Phase 1 + Phase 2)',
           'GET  /login':       '获取 QR 登录 URL',
           'GET  /login/check': '轮询 QR 扫码状态',
           'GET  /subscribe':   '订阅推送通知页面',
@@ -280,10 +295,25 @@ export default {
       }
     }
 
-    // ── POST /sync ──
+    // ── GET/POST /sync ──
     if (path === '/sync') {
+      const phase = url.searchParams.get('phase');
+
+      // Phase 2 only (called by Phase 1 internally)
+      if (phase === '2') {
+        try {
+          const result = await syncPhase2(env);
+          return json(result);
+        } catch (e: any) {
+          return json({ error: e.message }, 500);
+        }
+      }
+
+      // Phase 1 + Phase 2 (full sync)
       try {
-        const result = await sync(env);
+        // Build self URL for Phase 1 to call Phase 2
+        const selfUrl = `${url.protocol}//${url.host}`;
+        const result = await syncPhase1(env, selfUrl);
         const text = formatResult(result);
         await env.KV.put('last_sync', JSON.stringify(result), { expirationTtl: 86400 * 4 });
         await env.KV.put('last_sync_text', text, { expirationTtl: 86400 * 4 });

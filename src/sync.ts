@@ -13,6 +13,21 @@ const PLAYLIST_PREFIX_DEFAULT = 'NCM Daily ';
 const KEEP_DAYS_DEFAULT = 3;
 const STOREFRONT_DEFAULT = 'jp';
 
+/** Data stored in KV between Phase 1 and Phase 2 */
+interface PendingSync {
+  date: string;
+  foundIds: string[];
+  total: number;
+  found: number;
+  notFound: string[];
+  developerToken: string;
+  storefront: string;
+  userToken: string;
+  prefix: string;
+  keepDays: number;
+  playlistName: string;
+}
+
 /**
  * Get valid NCM cookie — check login, refresh if needed, save to KV.
  */
@@ -53,20 +68,9 @@ async function getValidCookie(env: Env): Promise<string> {
   );
 }
 
-/**
- * Main sync: NCM daily songs → Apple Music playlist
- */
-export async function sync(env: Env): Promise<SyncResult> {
-  const prefix = env.PLAYLIST_PREFIX || PLAYLIST_PREFIX_DEFAULT;
-  const keepDays = parseInt(env.KEEP_DAYS || String(KEEP_DAYS_DEFAULT), 10);
-  const storefront = env.STOREFRONT || STOREFRONT_DEFAULT;
-
-  // Time in UTC+8
-  const now = new Date(Date.now() + 8 * 3600 * 1000);
-  const dateStr = now.toISOString().slice(0, 10);
-  const playlistName = `${prefix}${dateStr}`;
-
-  const result: SyncResult = {
+/** Build empty result shell */
+function emptyResult(dateStr: string): SyncResult {
+  return {
     date: dateStr,
     total: 0,
     found: 0,
@@ -75,8 +79,25 @@ export async function sync(env: Env): Promise<SyncResult> {
     deletedPlaylists: [],
     errors: [],
   };
+}
 
-  // 1. Get Apple Music developer token (use existing or generate)
+/**
+ * Phase 1: Fetch NCM songs + search Apple Music.
+ * Stores pending data in KV, then triggers Phase 2.
+ */
+export async function syncPhase1(env: Env, selfUrl?: string): Promise<SyncResult> {
+  const storefront = env.STOREFRONT || STOREFRONT_DEFAULT;
+  const prefix = env.PLAYLIST_PREFIX || PLAYLIST_PREFIX_DEFAULT;
+  const keepDays = parseInt(env.KEEP_DAYS || String(KEEP_DAYS_DEFAULT), 10);
+
+  // Time in UTC+8
+  const now = new Date(Date.now() + 8 * 3600 * 1000);
+  const dateStr = now.toISOString().slice(0, 10);
+  const playlistName = `${prefix}${dateStr}`;
+
+  const result = emptyResult(dateStr);
+
+  // 1. Get Apple Music developer token
   let developerToken: string;
   if (env.AM_DEVELOPER_TOKEN) {
     developerToken = env.AM_DEVELOPER_TOKEN;
@@ -93,7 +114,7 @@ export async function sync(env: Env): Promise<SyncResult> {
     }
   }
 
-  // 2. Get valid NCM cookie (auto-refresh if expired)
+  // 2. Get valid NCM cookie
   let cookie: string;
   try {
     cookie = await getValidCookie(env);
@@ -109,7 +130,6 @@ export async function sync(env: Env): Promise<SyncResult> {
     songs = r.songs;
   } catch (e: any) {
     if (e instanceof AuthError) {
-      // One more attempt: force refresh and retry
       console.log('[NCM] Auth error on fetch, retrying after refresh...');
       const newCookie = await refreshLoginRaw(cookie);
       if (newCookie) {
@@ -117,7 +137,7 @@ export async function sync(env: Env): Promise<SyncResult> {
         const r = await getDailySongs(newCookie);
         songs = r.songs;
       } else {
-        result.errors.push(`NCM auth expired and refresh failed`);
+        result.errors.push('NCM auth expired and refresh failed');
         return result;
       }
     } else {
@@ -149,26 +169,81 @@ export async function sync(env: Env): Promise<SyncResult> {
     }
   }
 
-  // 5. Check if playlist already exists
+  // 5. Store pending data for Phase 2
+  const pending: PendingSync = {
+    date: dateStr,
+    foundIds,
+    total: result.total,
+    found: result.found,
+    notFound: result.notFound,
+    developerToken,
+    storefront,
+    userToken: env.AM_USER_TOKEN,
+    prefix,
+    keepDays,
+    playlistName,
+  };
+  await env.KV.put('sync_pending', JSON.stringify(pending), { expirationTtl: 300 });
+
+  // 6. Trigger Phase 2
+  if (selfUrl) {
+    try {
+      const phase2Url = `${selfUrl}/sync?phase=2`;
+      console.log(`[Phase1] Triggering Phase 2: ${phase2Url}`);
+      const resp = await fetch(phase2Url, { method: 'GET' });
+      const phase2Result: SyncResult = await resp.json() as SyncResult;
+      // Merge Phase 2 results back
+      result.playlistId = phase2Result.playlistId;
+      result.deletedPlaylists = phase2Result.deletedPlaylists;
+      if (phase2Result.errors.length > 0) {
+        result.errors.push(...phase2Result.errors);
+      }
+    } catch (e: any) {
+      result.errors.push(`Phase 2 trigger failed: ${e.message}`);
+    }
+  } else {
+    result.errors.push('Phase 2 skipped: no self URL available');
+  }
+
+  return result;
+}
+
+/**
+ * Phase 2: Read pending sync data from KV, create playlist and add songs.
+ */
+export async function syncPhase2(env: Env): Promise<SyncResult> {
+  const raw = await env.KV.get('sync_pending');
+  if (!raw) {
+    throw new Error('No pending sync data. Run Phase 1 first.');
+  }
+
+  const pending: PendingSync = JSON.parse(raw);
+  const result = emptyResult(pending.date);
+  result.total = pending.total;
+  result.found = pending.found;
+  result.notFound = pending.notFound;
+
+  // 1. Check if playlist already exists
   let existingPlaylists: { id: string; name: string }[];
   try {
-    existingPlaylists = await listPlaylists(developerToken, env.AM_USER_TOKEN);
+    existingPlaylists = await listPlaylists(pending.developerToken, pending.userToken);
   } catch (e: any) {
     result.errors.push(`List playlists failed: ${e.message}`);
+    await env.KV.delete('sync_pending');
     return result;
   }
 
-  const existing = existingPlaylists.find((p) => p.name === playlistName);
+  const existing = existingPlaylists.find((p) => p.name === pending.playlistName);
 
-  // 6. Create or update playlist
-  if (foundIds.length > 0) {
+  // 2. Create or update playlist
+  if (pending.foundIds.length > 0) {
     try {
       if (existing) {
-        await addSongsToPlaylist(existing.id, foundIds, developerToken, env.AM_USER_TOKEN);
+        await addSongsToPlaylist(existing.id, pending.foundIds, pending.developerToken, pending.userToken);
         result.playlistId = existing.id;
       } else {
-        const plId = await createPlaylist(playlistName, developerToken, env.AM_USER_TOKEN);
-        await addSongsToPlaylist(plId, foundIds, developerToken, env.AM_USER_TOKEN);
+        const plId = await createPlaylist(pending.playlistName, pending.developerToken, pending.userToken);
+        await addSongsToPlaylist(plId, pending.foundIds, pending.developerToken, pending.userToken);
         result.playlistId = plId;
       }
     } catch (e: any) {
@@ -176,22 +251,26 @@ export async function sync(env: Env): Promise<SyncResult> {
     }
   }
 
-  // 7. Clean up old playlists
-  const cutoffDate = new Date(now.getTime() - (keepDays - 1) * 86400000);
+  // 3. Clean up old playlists
+  const now = new Date(Date.now() + 8 * 3600 * 1000);
+  const cutoffDate = new Date(now.getTime() - (pending.keepDays - 1) * 86400000);
   const cutoffStr = cutoffDate.toISOString().slice(0, 10);
 
   for (const pl of existingPlaylists) {
-    if (!pl.name.startsWith(prefix)) continue;
-    const plDate = pl.name.slice(prefix.length);
+    if (!pl.name.startsWith(pending.prefix)) continue;
+    const plDate = pl.name.slice(pending.prefix.length);
     if (/^\d{4}-\d{2}-\d{2}$/.test(plDate) && plDate < cutoffStr) {
       try {
-        await deletePlaylist(pl.id, developerToken, env.AM_USER_TOKEN);
+        await deletePlaylist(pl.id, pending.developerToken, pending.userToken);
         result.deletedPlaylists.push(pl.name);
       } catch (e: any) {
         result.errors.push(`Delete ${pl.name} failed: ${e.message}`);
       }
     }
   }
+
+  // Clean up pending data
+  await env.KV.delete('sync_pending');
 
   return result;
 }
