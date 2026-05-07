@@ -87,16 +87,24 @@ function uniqueQueries(queries: string[]): string[] {
   return Array.from(new Set(queries.map((query) => query.trim()).filter(Boolean)));
 }
 
+function normalizeSearchText(value: string): string {
+  return value
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[\s"'`·・:：,，.!！？?（）()\[\]\-_/]+/g, '');
+}
+
 function buildQueries(songName: string, artist: string, manualQuery?: string): string[] {
   if (manualQuery?.trim()) {
     return uniqueQueries([manualQuery]);
   }
 
   const cleanName = songName.replace(/\s*[\(（]feat\.?[^)）]*[)）]/gi, '').trim();
-  const queries = [`${songName} ${artist}`];
+  const queries = [`${songName} ${artist}`, songName];
 
   if (cleanName && cleanName !== songName) {
     queries.push(`${cleanName} ${artist}`);
+    queries.push(cleanName);
   }
 
   if (artist.includes('/')) {
@@ -150,15 +158,16 @@ function scoreSong(
   songName: string,
   artist: string,
   manualQuery?: string,
+  searchRank = 0,
 ): number {
   const cleanName = songName.replace(/\s*[\(（]feat\.?[^)）]*[)）]/gi, '').trim();
   const isLive = /[\(\[]live[\)\]]/i.test(songName) || /- live$/i.test(songName);
-  const sName = (song.name || song.trackName || '').toLowerCase();
-  const sArtist = (song.artistName || song.artist || '').toLowerCase();
-  const songLower = songName.toLowerCase();
-  const cleanLower = cleanName.toLowerCase();
-  const artistLower = artist.toLowerCase();
-  const manualLower = manualQuery?.toLowerCase().trim() || '';
+  const sName = normalizeSearchText(song.name || song.trackName || '');
+  const sArtist = normalizeSearchText(song.artistName || song.artist || '');
+  const songLower = normalizeSearchText(songName);
+  const cleanLower = normalizeSearchText(cleanName);
+  const artistLower = normalizeSearchText(artist);
+  const manualLower = normalizeSearchText(manualQuery || '');
   let score = 0;
 
   if (sName === songLower || sName === cleanLower) score += 10;
@@ -177,6 +186,8 @@ function scoreSong(
     if (sName.includes(manualLower)) score += 2;
     if (sArtist.includes(manualLower)) score += 1;
   }
+
+  score += Math.max(CANDIDATE_LIMIT - searchRank, 0);
 
   return score;
 }
@@ -211,35 +222,35 @@ export async function searchSongCandidates(
   for (const query of queries) {
     try {
       const encoded = encodeURIComponent(query);
-      const data = await amFetch(
-        `/catalog/${storefront}/search?term=${encoded}&types=songs&limit=${CANDIDATE_LIMIT}`,
-        developerToken,
-      );
-      const songs = data?.results?.songs?.data || [];
-      allLists.push(
-        songs.map((song: any) =>
-          normalizeCatalogCandidate(song, scoreSong(song.attributes, songName, artist, manualQuery)),
-        ),
-      );
-    } catch {
-      // Fall through to iTunes for this query.
-    }
+        const data = await amFetch(
+          `/catalog/${storefront}/search?term=${encoded}&types=songs&limit=${CANDIDATE_LIMIT}`,
+          developerToken,
+        );
+        const songs = data?.results?.songs?.data || [];
+        allLists.push(
+          songs.map((song: any, index: number) =>
+            normalizeCatalogCandidate(song, scoreSong(song.attributes, songName, artist, manualQuery, index)),
+          ),
+        );
+      } catch {
+        // Fall through to iTunes for this query.
+      }
 
     try {
       const encoded = encodeURIComponent(query);
       const resp = await fetch(
         `https://itunes.apple.com/search?term=${encoded}&entity=song&limit=${CANDIDATE_LIMIT}&country=${storefront}`,
       );
-      if (resp.ok) {
-        const data: any = await resp.json();
-        const songs = data.results || [];
-        allLists.push(
-          songs.map((song: any) =>
-            normalizeItunesCandidate(song, scoreSong(song, songName, artist, manualQuery)),
-          ),
-        );
-      }
-    } catch {
+        if (resp.ok) {
+          const data: any = await resp.json();
+          const songs = data.results || [];
+          allLists.push(
+            songs.map((song: any, index: number) =>
+              normalizeItunesCandidate(song, scoreSong(song, songName, artist, manualQuery, index)),
+            ),
+          );
+        }
+      } catch {
       // Ignore per-query iTunes failures too.
     }
   }

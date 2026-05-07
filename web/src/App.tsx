@@ -248,10 +248,31 @@ export default function App() {
   const [pushSubscribed, setPushSubscribed] = useState(false);
   const [vapidKey, setVapidKey] = useState('');
   const [statusInfo, setStatusInfo] = useState<StatusPayload | null>(null);
+  const [pendingActions, setPendingActions] = useState<Record<string, boolean>>({});
+  const [editingMatched, setEditingMatched] = useState<number[]>([]);
 
   const addLog = useCallback((tone: LogEntry['tone'], message: string) => {
     setLogs((current) => [{ id: makeId(), tone, message }, ...current].slice(0, 40));
   }, []);
+
+  const runWithPending = useCallback(async <T,>(key: string, action: () => Promise<T>): Promise<T> => {
+    setPendingActions((current) => ({ ...current, [key]: true }));
+    try {
+      return await action();
+    } finally {
+      setPendingActions((current) => {
+        const next = { ...current };
+        delete next[key];
+        return next;
+      });
+    }
+  }, []);
+
+  const isPending = useCallback((key: string) => Boolean(pendingActions[key]), [pendingActions]);
+  const hasPendingPrefix = useCallback(
+    (prefix: string) => Object.keys(pendingActions).some((key) => key.startsWith(prefix)),
+    [pendingActions],
+  );
 
   const saveAuth = useCallback(
     (nextToken: string, nextSession: string, nextAuto: boolean) => {
@@ -382,24 +403,30 @@ export default function App() {
 
   const refreshSession = useCallback(async () => {
     if (!token) return;
-    if (payload?.sessionId) {
-      await restoreSession(payload.sessionId);
-      return;
-    }
-    if (querySession) {
-      await restoreSession(querySession);
-      return;
-    }
-    await restoreActiveSession();
-  }, [payload?.sessionId, querySession, restoreActiveSession, restoreSession, token]);
+    await runWithPending('refresh-session', async () => {
+      if (payload?.sessionId) {
+        await restoreSession(payload.sessionId);
+        return;
+      }
+      if (querySession) {
+        await restoreSession(querySession);
+        return;
+      }
+      await restoreActiveSession();
+    });
+  }, [payload?.sessionId, querySession, restoreActiveSession, restoreSession, runWithPending, token]);
 
   const retrySearch = useCallback(
     async (song: SongMatch) => {
       try {
-        const nextPayload = await api<SyncResponse>(
-          `/sync?phase=2-search&session=${encodeURIComponent(payload!.sessionId)}&ncmId=${song.ncmId}&query=${encodeURIComponent(
-            queries[song.ncmId] || song.query,
-          )}`,
+        const nextPayload = await runWithPending(
+          `retry-${song.ncmId}`,
+          async () =>
+            api<SyncResponse>(
+              `/sync?phase=2-search&session=${encodeURIComponent(payload!.sessionId)}&ncmId=${song.ncmId}&query=${encodeURIComponent(
+                queries[song.ncmId] || song.query,
+              )}`,
+            ),
         );
         applyPayload(nextPayload);
         addLog('info', `已刷新 ${song.ncmName} 的候选列表`);
@@ -407,105 +434,123 @@ export default function App() {
         addLog('error', (error as Error).message);
       }
     },
-    [addLog, api, applyPayload, payload, queries],
+    [addLog, api, applyPayload, payload, queries, runWithPending],
   );
 
   const selectCandidate = useCallback(
     async (song: SongMatch, candidateId: string) => {
       try {
-        const nextPayload = await api<SyncResponse>(
-          `/sync?phase=2-select&session=${encodeURIComponent(payload!.sessionId)}&ncmId=${song.ncmId}&candidateId=${encodeURIComponent(
-            candidateId,
-          )}`,
+        const nextPayload = await runWithPending(
+          `select-${song.ncmId}-${candidateId}`,
+          async () =>
+            api<SyncResponse>(
+              `/sync?phase=2-select&session=${encodeURIComponent(payload!.sessionId)}&ncmId=${song.ncmId}&candidateId=${encodeURIComponent(
+                candidateId,
+              )}`,
+            ),
         );
         applyPayload(nextPayload);
+        setEditingMatched((current) => current.filter((id) => id !== song.ncmId));
         addLog('success', `已确认 ${song.ncmName}`);
       } catch (error) {
         addLog('error', (error as Error).message);
       }
     },
-    [addLog, api, applyPayload, payload],
+    [addLog, api, applyPayload, payload, runWithPending],
   );
 
   const skipSong = useCallback(
     async (song: SongMatch) => {
       try {
-        const nextPayload = await api<SyncResponse>(
-          `/sync?phase=2-skip-song&session=${encodeURIComponent(payload!.sessionId)}&ncmId=${song.ncmId}`,
+        const nextPayload = await runWithPending(
+          `skip-${song.ncmId}`,
+          async () =>
+            api<SyncResponse>(
+              `/sync?phase=2-skip-song&session=${encodeURIComponent(payload!.sessionId)}&ncmId=${song.ncmId}`,
+            ),
         );
         applyPayload(nextPayload);
+        setEditingMatched((current) => current.filter((id) => id !== song.ncmId));
         addLog('info', `已跳过 ${song.ncmName}`);
       } catch (error) {
         addLog('error', (error as Error).message);
       }
     },
-    [addLog, api, applyPayload, payload],
+    [addLog, api, applyPayload, payload, runWithPending],
   );
 
   const continueReview = useCallback(async () => {
     if (!payload) return;
     try {
-      const nextPayload = await api<SyncResponse>(
-        `/sync?phase=2-continue&session=${encodeURIComponent(payload.sessionId)}`,
+      const nextPayload = await runWithPending(
+        'continue-review',
+        async () =>
+          api<SyncResponse>(
+            `/sync?phase=2-continue&session=${encodeURIComponent(payload.sessionId)}`,
+          ),
       );
       applyPayload(nextPayload);
       addLog('info', 'Phase 2 人工确认完成，继续后续流程');
     } catch (error) {
       addLog('error', (error as Error).message);
     }
-  }, [addLog, api, applyPayload, payload]);
+  }, [addLog, api, applyPayload, payload, runWithPending]);
 
   const subscribePush = useCallback(async () => {
     if (!pushSupported || !token) return;
     try {
-      let nextVapidKey = vapidKey;
-      if (!nextVapidKey) {
-        const response = await api<{ publicKey: string }>('/vapid-key');
-        nextVapidKey = response.publicKey;
-        setVapidKey(nextVapidKey);
-      }
-      if (Notification.permission !== 'granted') {
-        const permission = await Notification.requestPermission();
-        if (permission !== 'granted') throw new Error('通知权限被拒绝');
-      }
-      const registration = await navigator.serviceWorker.ready;
-      const pad = '='.repeat((4 - nextVapidKey.length % 4) % 4);
-      const normalized = (nextVapidKey + pad).replace(/-/g, '+').replace(/_/g, '/');
-      const applicationServerKey = Uint8Array.from(atob(normalized), (char) => char.charCodeAt(0));
-      const subscription = await registration.pushManager.subscribe({
-        userVisibleOnly: true,
-        applicationServerKey,
+      await runWithPending('subscribe-push', async () => {
+        let nextVapidKey = vapidKey;
+        if (!nextVapidKey) {
+          const response = await api<{ publicKey: string }>('/vapid-key');
+          nextVapidKey = response.publicKey;
+          setVapidKey(nextVapidKey);
+        }
+        if (Notification.permission !== 'granted') {
+          const permission = await Notification.requestPermission();
+          if (permission !== 'granted') throw new Error('通知权限被拒绝');
+        }
+        const registration = await navigator.serviceWorker.ready;
+        const pad = '='.repeat((4 - nextVapidKey.length % 4) % 4);
+        const normalized = (nextVapidKey + pad).replace(/-/g, '+').replace(/_/g, '/');
+        const applicationServerKey = Uint8Array.from(atob(normalized), (char) => char.charCodeAt(0));
+        const subscription = await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey,
+        });
+        const response = await fetch('/subscribe', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(subscription.toJSON()),
+        });
+        if (!response.ok) throw new Error('订阅请求失败');
+        await refreshPushState();
       });
-      const response = await fetch('/subscribe', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(subscription.toJSON()),
-      });
-      if (!response.ok) throw new Error('订阅请求失败');
-      await refreshPushState();
     } catch (error) {
       addLog('error', (error as Error).message);
     }
-  }, [addLog, api, pushSupported, refreshPushState, token, vapidKey]);
+  }, [addLog, api, pushSupported, refreshPushState, runWithPending, token, vapidKey]);
 
   const unsubscribePush = useCallback(async () => {
     if (!pushSupported) return;
     try {
-      const registration = await navigator.serviceWorker.ready;
-      const subscription = await registration.pushManager.getSubscription();
-      if (subscription) {
-        await fetch('/subscribe', {
-          method: 'DELETE',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ endpoint: subscription.endpoint }),
-        });
-        await subscription.unsubscribe();
-      }
-      await refreshPushState();
+      await runWithPending('unsubscribe-push', async () => {
+        const registration = await navigator.serviceWorker.ready;
+        const subscription = await registration.pushManager.getSubscription();
+        if (subscription) {
+          await fetch('/subscribe', {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ endpoint: subscription.endpoint }),
+          });
+          await subscription.unsubscribe();
+        }
+        await refreshPushState();
+      });
     } catch (error) {
       addLog('error', (error as Error).message);
     }
-  }, [addLog, pushSupported, refreshPushState]);
+  }, [addLog, pushSupported, refreshPushState, runWithPending]);
 
   useEffect(() => {
     const savedToken = localStorage.getItem(STORAGE_TOKEN) || '';
@@ -531,6 +576,12 @@ export default function App() {
   useEffect(() => {
     void refreshStatus();
   }, [refreshStatus]);
+
+  const toggleMatchedEditor = useCallback((ncmId: number) => {
+    setEditingMatched((current) =>
+      current.includes(ncmId) ? current.filter((id) => id !== ncmId) : [...current, ncmId],
+    );
+  }, []);
 
   useEffect(() => {
     if (!bootToken || token !== bootToken) return;
@@ -619,8 +670,8 @@ export default function App() {
                 开始同步
               </Button>
               {(querySession || localStorage.getItem(STORAGE_SESSION)) && token ? (
-                <Button variant="secondary" onClick={() => void refreshSession()}>
-                  <RefreshCw />
+                <Button variant="secondary" onClick={() => void refreshSession()} disabled={isPending('refresh-session')}>
+                  {isPending('refresh-session') ? <Loader2 className="animate-spin" /> : <RefreshCw />}
                   恢复会话
                 </Button>
               ) : null}
@@ -658,17 +709,17 @@ export default function App() {
               {payload.status === 'error' ? <Badge variant="destructive">错误</Badge> : null}
             </div>
           </div>
-          <div className="space-y-3">
-            <div className="flex flex-wrap justify-end gap-3">
-              <Button variant="secondary" onClick={() => void refreshSession()}>
-                <RefreshCw />
-                刷新状态
-              </Button>
-              <Button variant="default" onClick={() => void startSync()}>
-                <Sparkles />
-                新建会话
-              </Button>
-            </div>
+            <div className="space-y-3">
+              <div className="flex flex-wrap justify-end gap-3">
+                <Button variant="secondary" onClick={() => void refreshSession()} disabled={isPending('refresh-session')}>
+                  {isPending('refresh-session') ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+                  刷新状态
+                </Button>
+                <Button variant="default" onClick={() => void startSync()} disabled={busy}>
+                  {busy ? <Loader2 className="animate-spin" /> : <Sparkles />}
+                  新建会话
+                </Button>
+              </div>
             <label className="flex items-center justify-end gap-3 rounded-lg border border-border/70 bg-muted/20 px-4 py-3 text-sm">
               <Checkbox checked={auto} onChange={(event) => setAuto(event.target.checked)} />
               <span className="font-medium">Automatic Skip Missing Songs</span>
@@ -838,8 +889,8 @@ export default function App() {
                     <AlertDescription>候选列表已经默认展示。点选目标歌曲即可确认，找不到就跳过，然后继续下一步。</AlertDescription>
                   </Alert>
                   <div className="flex flex-wrap items-center gap-3">
-                    <Button onClick={() => void continueReview()}>
-                      <ArrowRight />
+                    <Button onClick={() => void continueReview()} disabled={isPending('continue-review')}>
+                      {isPending('continue-review') ? <Loader2 className="animate-spin" /> : <ArrowRight />}
                       继续下一步
                     </Button>
                     <Badge variant="warning">{unresolved.length} 首待处理</Badge>
@@ -850,90 +901,103 @@ export default function App() {
                   {unresolved.length ? (
                     <section className="space-y-4">
                       <h3 className="text-base font-semibold">待处理歌曲</h3>
-                      {unresolved.map((song) => (
-                        <div key={song.ncmId} className="rounded-2xl border border-amber-500/20 bg-card/80 p-4">
-                          <div className="mb-4 flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
-                            <div className="flex items-start gap-4">
-                              <SongArtwork song={{ cover: song.ncmCover, name: song.ncmName }} />
-                              <div className="space-y-1">
-                                <div className="text-lg font-semibold">{song.ncmName}</div>
-                                <div className="text-sm text-muted-foreground">
-                                  {song.ncmArtist} · {song.ncmAlbum}
+                      {unresolved.map((song) => {
+                        const retryPending = isPending(`retry-${song.ncmId}`);
+                        const skipPending = isPending(`skip-${song.ncmId}`);
+                        const selecting = hasPendingPrefix(`select-${song.ncmId}-`);
+                        const songBusy = retryPending || skipPending || selecting;
+
+                        return (
+                          <div key={song.ncmId} className="rounded-2xl border border-amber-500/20 bg-card/80 p-4">
+                            <div className="mb-4 flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+                              <div className="flex items-start gap-4">
+                                <SongArtwork song={{ cover: song.ncmCover, name: song.ncmName }} />
+                                <div className="space-y-1">
+                                  <div className="text-lg font-semibold">{song.ncmName}</div>
+                                  <div className="text-sm text-muted-foreground">
+                                    {song.ncmArtist} · {song.ncmAlbum}
+                                  </div>
+                                  <a className="inline-flex items-center gap-1 text-sm text-primary" href={song.ncmUrl} target="_blank" rel="noreferrer">
+                                    网易云原曲 <ExternalLink className="size-3" />
+                                  </a>
                                 </div>
-                                <a className="inline-flex items-center gap-1 text-sm text-primary" href={song.ncmUrl} target="_blank" rel="noreferrer">
-                                  网易云原曲 <ExternalLink className="size-3" />
-                                </a>
                               </div>
+                              <Badge variant={badgeVariant(song.status)}>{song.status}</Badge>
                             </div>
-                            <Badge variant={badgeVariant(song.status)}>{song.status}</Badge>
-                          </div>
 
-                          <div className="mb-4 flex flex-col gap-3 md:flex-row">
-                            <Input
-                              value={queries[song.ncmId] ?? song.query}
-                              onChange={(event) => setQueries((current) => ({ ...current, [song.ncmId]: event.target.value }))}
-                              placeholder="输入新的 Apple Music 搜索词"
-                            />
-                            <Button variant="secondary" onClick={() => void retrySearch(song)}>
-                              <Search />
-                              重新搜索
-                            </Button>
-                            <Button variant="outline" onClick={() => void skipSong(song)}>
-                              <SkipForward />
-                              跳过此首
-                            </Button>
-                          </div>
-
-                          {song.issues.length ? (
-                            <div className="mb-4 space-y-2">
-                              {song.issues.map((issue) => (
-                                <Alert key={issue.id} variant="destructive">
-                                  <AlertTitle>{issue.code}</AlertTitle>
-                                  <AlertDescription>{issue.message}</AlertDescription>
-                                </Alert>
-                              ))}
+                            <div className="mb-4 flex flex-col gap-3 md:flex-row">
+                              <Input
+                                value={queries[song.ncmId] ?? song.query}
+                                onChange={(event) => setQueries((current) => ({ ...current, [song.ncmId]: event.target.value }))}
+                                placeholder="输入新的 Apple Music 搜索词"
+                                disabled={songBusy}
+                              />
+                              <Button variant="secondary" onClick={() => void retrySearch(song)} disabled={songBusy}>
+                                {retryPending ? <Loader2 className="animate-spin" /> : <Search />}
+                                重新搜索
+                              </Button>
+                              <Button variant="outline" onClick={() => void skipSong(song)} disabled={songBusy}>
+                                {skipPending ? <Loader2 className="animate-spin" /> : <SkipForward />}
+                                跳过此首
+                              </Button>
                             </div>
-                          ) : null}
 
-                          <div className="grid gap-3 md:grid-cols-2">
-                            {song.candidates.length ? (
-                              song.candidates.map((candidate) => {
-                                const selected = song.selectedCandidate?.id === candidate.id && song.status === 'matched';
-                                return (
-                                  <button
-                                    key={candidate.id}
-                                    type="button"
-                                    onClick={() => void selectCandidate(song, candidate.id)}
-                                    className={`rounded-xl border p-3 text-left transition hover:border-primary/50 hover:bg-muted/40 ${
-                                      selected ? 'border-primary/60 bg-primary/10' : 'border-border/70 bg-muted/20'
-                                    }`}
-                                  >
-                                    <div className="flex gap-3">
-                                      <CandidateArtwork candidate={candidate} />
-                                      <div className="min-w-0 flex-1 space-y-1">
-                                        <div className="truncate font-medium">{candidate.name}</div>
-                                        <div className="truncate text-sm text-muted-foreground">
-                                          {candidate.artist} · {candidate.album || '-'}
-                                        </div>
-                                        <div className="flex flex-wrap gap-2 pt-1">
-                                          <Badge variant="outline">score {candidate.score}</Badge>
-                                          <Badge variant="outline">{candidate.source}</Badge>
-                                          {selected ? <Badge variant="success">已选择</Badge> : null}
+                            {song.issues.length ? (
+                              <div className="mb-4 space-y-2">
+                                {song.issues.map((issue) => (
+                                  <Alert key={issue.id} variant="destructive">
+                                    <AlertTitle>{issue.code}</AlertTitle>
+                                    <AlertDescription>{issue.message}</AlertDescription>
+                                  </Alert>
+                                ))}
+                              </div>
+                            ) : null}
+
+                            <div className="grid gap-3 md:grid-cols-2">
+                              {song.candidates.length ? (
+                                song.candidates.map((candidate) => {
+                                  const selected = song.selectedCandidate?.id === candidate.id && song.status === 'matched';
+                                  const selectPending = isPending(`select-${song.ncmId}-${candidate.id}`);
+                                  return (
+                                    <button
+                                      key={candidate.id}
+                                      type="button"
+                                      onClick={() => void selectCandidate(song, candidate.id)}
+                                      disabled={songBusy}
+                                      className={`rounded-xl border p-3 text-left transition hover:border-primary/50 hover:bg-muted/40 disabled:cursor-not-allowed disabled:opacity-70 ${
+                                        selected ? 'border-primary/60 bg-primary/10' : 'border-border/70 bg-muted/20'
+                                      }`}
+                                    >
+                                      <div className="flex gap-3">
+                                        <CandidateArtwork candidate={candidate} />
+                                        <div className="min-w-0 flex-1 space-y-1">
+                                          <div className="flex items-center justify-between gap-2">
+                                            <div className="truncate font-medium">{candidate.name}</div>
+                                            {selectPending ? <Loader2 className="size-4 animate-spin text-primary" /> : null}
+                                          </div>
+                                          <div className="truncate text-sm text-muted-foreground">
+                                            {candidate.artist} · {candidate.album || '-'}
+                                          </div>
+                                          <div className="flex flex-wrap gap-2 pt-1">
+                                            <Badge variant="outline">score {candidate.score}</Badge>
+                                            <Badge variant="outline">{candidate.source}</Badge>
+                                            {selected ? <Badge variant="success">已选择</Badge> : null}
+                                          </div>
                                         </div>
                                       </div>
-                                    </div>
-                                  </button>
-                                );
-                              })
-                            ) : (
-                              <Alert variant="warning">
-                                <AlertTitle>暂无候选结果</AlertTitle>
-                                <AlertDescription>请修改搜索词后重试，或者直接跳过这首歌。</AlertDescription>
-                              </Alert>
-                            )}
+                                    </button>
+                                  );
+                                })
+                              ) : (
+                                <Alert variant="warning">
+                                  <AlertTitle>暂无候选结果</AlertTitle>
+                                  <AlertDescription>请修改搜索词后重试，或者直接跳过这首歌。</AlertDescription>
+                                </Alert>
+                              )}
+                            </div>
                           </div>
-                        </div>
-                      ))}
+                        );
+                      })}
                     </section>
                   ) : null}
 
@@ -941,28 +1005,96 @@ export default function App() {
                     <section className="space-y-3">
                       <h3 className="text-base font-semibold">已确认歌曲</h3>
                       <div className="grid gap-3 md:grid-cols-2">
-                        {matched.map((song) => (
-                          <div key={song.ncmId} className="rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-4">
-                            <div className="mb-3 flex items-start justify-between gap-3">
-                              <div>
-                                <div className="font-medium">{song.ncmName}</div>
-                                <div className="text-sm text-muted-foreground">{song.ncmArtist}</div>
-                              </div>
-                              <Badge variant="success">{song.decisionSource === 'automatic' ? '自动匹配' : '人工确认'}</Badge>
-                            </div>
-                            {song.selectedCandidate ? (
-                              <div className="flex items-center gap-3 rounded-lg border border-border/60 bg-background/60 p-3">
-                                <CandidateArtwork candidate={song.selectedCandidate} />
-                                <div className="min-w-0 flex-1">
-                                  <div className="truncate font-medium">{song.selectedCandidate.name}</div>
-                                  <div className="truncate text-sm text-muted-foreground">
-                                    {song.selectedCandidate.artist} · {song.selectedCandidate.album || '-'}
-                                  </div>
+                        {matched.map((song) => {
+                          const retryPending = isPending(`retry-${song.ncmId}`);
+                          const skipPending = isPending(`skip-${song.ncmId}`);
+                          const selecting = hasPendingPrefix(`select-${song.ncmId}-`);
+                          const songBusy = retryPending || skipPending || selecting;
+                          const editing = editingMatched.includes(song.ncmId);
+
+                          return (
+                            <div key={song.ncmId} className="rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-4">
+                              <div className="mb-3 flex items-start justify-between gap-3">
+                                <div>
+                                  <div className="font-medium">{song.ncmName}</div>
+                                  <div className="text-sm text-muted-foreground">{song.ncmArtist}</div>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                  <Badge variant="success">{song.decisionSource === 'automatic' ? '自动匹配' : '人工确认'}</Badge>
+                                  <Button variant="outline" size="sm" onClick={() => toggleMatchedEditor(song.ncmId)} disabled={songBusy}>
+                                    {editing ? '收起' : '重新选择'}
+                                  </Button>
                                 </div>
                               </div>
-                            ) : null}
-                          </div>
-                        ))}
+                              {song.selectedCandidate ? (
+                                <div className="flex items-center gap-3 rounded-lg border border-border/60 bg-background/60 p-3">
+                                  <CandidateArtwork candidate={song.selectedCandidate} />
+                                  <div className="min-w-0 flex-1">
+                                    <div className="truncate font-medium">{song.selectedCandidate.name}</div>
+                                    <div className="truncate text-sm text-muted-foreground">
+                                      {song.selectedCandidate.artist} · {song.selectedCandidate.album || '-'}
+                                    </div>
+                                  </div>
+                                </div>
+                              ) : null}
+                              {editing ? (
+                                <div className="mt-4 space-y-4">
+                                  <div className="flex flex-col gap-3 md:flex-row">
+                                    <Input
+                                      value={queries[song.ncmId] ?? song.query}
+                                      onChange={(event) => setQueries((current) => ({ ...current, [song.ncmId]: event.target.value }))}
+                                      placeholder="输入新的 Apple Music 搜索词"
+                                      disabled={songBusy}
+                                    />
+                                    <Button variant="secondary" onClick={() => void retrySearch(song)} disabled={songBusy}>
+                                      {retryPending ? <Loader2 className="animate-spin" /> : <Search />}
+                                      重新搜索
+                                    </Button>
+                                    <Button variant="outline" onClick={() => void skipSong(song)} disabled={songBusy}>
+                                      {skipPending ? <Loader2 className="animate-spin" /> : <SkipForward />}
+                                      跳过此首
+                                    </Button>
+                                  </div>
+                                  <div className="grid gap-3">
+                                    {song.candidates.map((candidate) => {
+                                      const selected = song.selectedCandidate?.id === candidate.id && song.status === 'matched';
+                                      const selectPending = isPending(`select-${song.ncmId}-${candidate.id}`);
+                                      return (
+                                        <button
+                                          key={candidate.id}
+                                          type="button"
+                                          onClick={() => void selectCandidate(song, candidate.id)}
+                                          disabled={songBusy}
+                                          className={`rounded-xl border p-3 text-left transition hover:border-primary/50 hover:bg-muted/40 disabled:cursor-not-allowed disabled:opacity-70 ${
+                                            selected ? 'border-primary/60 bg-primary/10' : 'border-border/70 bg-background/70'
+                                          }`}
+                                        >
+                                          <div className="flex gap-3">
+                                            <CandidateArtwork candidate={candidate} />
+                                            <div className="min-w-0 flex-1 space-y-1">
+                                              <div className="flex items-center justify-between gap-2">
+                                                <div className="truncate font-medium">{candidate.name}</div>
+                                                {selectPending ? <Loader2 className="size-4 animate-spin text-primary" /> : null}
+                                              </div>
+                                              <div className="truncate text-sm text-muted-foreground">
+                                                {candidate.artist} · {candidate.album || '-'}
+                                              </div>
+                                              <div className="flex flex-wrap gap-2 pt-1">
+                                                <Badge variant="outline">score {candidate.score}</Badge>
+                                                <Badge variant="outline">{candidate.source}</Badge>
+                                                {selected ? <Badge variant="success">当前选择</Badge> : null}
+                                              </div>
+                                            </div>
+                                          </div>
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                </div>
+                              ) : null}
+                            </div>
+                          );
+                        })}
                       </div>
                     </section>
                   ) : null}
@@ -1004,12 +1136,16 @@ export default function App() {
                 {pushSubscribed ? <Badge variant="success">已订阅</Badge> : <Badge variant="outline">未订阅</Badge>}
               </div>
               <div className="flex flex-wrap gap-3">
-                <Button onClick={() => void subscribePush()} disabled={!pushSupported || pushSubscribed}>
-                  <Bell />
+                <Button onClick={() => void subscribePush()} disabled={!pushSupported || pushSubscribed || isPending('subscribe-push')}>
+                  {isPending('subscribe-push') ? <Loader2 className="animate-spin" /> : <Bell />}
                   开启通知
                 </Button>
-                <Button variant="secondary" onClick={() => void unsubscribePush()} disabled={!pushSupported || !pushSubscribed}>
-                  <BellOff />
+                <Button
+                  variant="secondary"
+                  onClick={() => void unsubscribePush()}
+                  disabled={!pushSupported || !pushSubscribed || isPending('unsubscribe-push')}
+                >
+                  {isPending('unsubscribe-push') ? <Loader2 className="animate-spin" /> : <BellOff />}
                   取消通知
                 </Button>
               </div>

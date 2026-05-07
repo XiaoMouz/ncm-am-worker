@@ -183,7 +183,12 @@ function shouldAutoSelect(candidates: AmCandidate[]): boolean {
   return best.score - next.score >= AUTO_MATCH_MIN_GAP;
 }
 
-function applyCandidates(song: SongMatch, candidates: AmCandidate[], decisionSource: SongMatch['decisionSource']): void {
+function applyCandidates(
+  song: SongMatch,
+  candidates: AmCandidate[],
+  decisionSource: SongMatch['decisionSource'],
+  forceBestCandidate = false,
+): void {
   clearRetryableSongIssues(song);
   song.candidates = candidates;
   song.selectedCandidate = candidates[0] || null;
@@ -195,7 +200,7 @@ function applyCandidates(song: SongMatch, candidates: AmCandidate[], decisionSou
     return;
   }
 
-  if (decisionSource === 'automatic' && shouldAutoSelect(candidates)) {
+  if (decisionSource === 'automatic' && (shouldAutoSelect(candidates) || forceBestCandidate)) {
     song.status = 'matched';
     song.decisionSource = 'automatic';
     song.selectedCandidate = candidates[0];
@@ -610,7 +615,7 @@ export async function phase2(env: Env, session: SyncSession): Promise<SyncSessio
           developerToken,
           song.query,
         );
-        applyCandidates(song, candidates, 'automatic');
+        applyCandidates(song, candidates, 'automatic', session.auto);
       } catch (error) {
         const issue = createIssue({
           scope: 'song',
