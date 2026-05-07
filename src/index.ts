@@ -168,13 +168,23 @@ async function getDeveloperToken(env: Env): Promise<string> {
 
 async function serveFrontendAsset(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
+  const shouldServeIndex =
+    url.pathname === '/' ||
+    url.pathname === '/index.html' ||
+    url.pathname.endsWith('.html') ||
+    !url.pathname.split('/').pop()?.includes('.');
+
+  if (shouldServeIndex) {
+    const indexUrl = new URL('/index.html', url);
+    return env.ASSETS.fetch(new Request(indexUrl.toString(), request));
+  }
+
   const assetResponse = await env.ASSETS.fetch(request);
   if (assetResponse.status !== 404) {
     return assetResponse;
   }
 
-  const isExtensionlessRoute = !url.pathname.split('/').pop()?.includes('.');
-  if (url.pathname === '/' || isExtensionlessRoute) {
+  if (url.pathname.endsWith('.html')) {
     const indexUrl = new URL('/index.html', url);
     return env.ASSETS.fetch(new Request(indexUrl.toString(), request));
   }
