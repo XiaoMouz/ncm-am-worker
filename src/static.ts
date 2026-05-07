@@ -106,6 +106,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .btn-danger{background:transparent;color:#ff6b6b;border:1px solid #ff6b6b}
 .btn-sm{padding:8px 16px;font-size:13px}
 
+/* Notifications */
+.notifications{margin-top:20px;max-height:300px;overflow-y:auto}
+.notify-item{padding:8px 12px;border-radius:8px;margin-bottom:6px;font-size:13px;display:flex;align-items:flex-start;gap:8px}
+.notify-item.success{background:#1a3a1a;color:#4ade80}
+.notify-item.error{background:#3a1a1a;color:#ff6b6b}
+.notify-item.info{background:#1a1a3a;color:#60a5fa}
+.notify-item .notify-time{font-size:11px;color:#666;flex-shrink:0}
+
 /* Steps */
 .steps{display:flex;gap:4px;margin-bottom:24px}
 .step{flex:1;height:4px;border-radius:2px;background:#2a2a3e;transition:background .3s}
@@ -204,6 +212,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
     <div class="step" data-step="5"></div>
   </div>
   <div id="content"></div>
+  <div id="notifications" class="notifications"></div>
 </div>
 
 <script>
@@ -237,8 +246,16 @@ async function startSync() {
     const s = await api('/sync?auto=' + (AUTO ? '1' : '0'));
     SESSION = s.id;
     showWizard();
+    notify('info', '同步已启动' + (AUTO ? '（自动模式）' : ''));
     renderPhase(s);
+
+    // Auto-chain: after phase 1, trigger phase 2
+    if (AUTO && s.phase === 2 && s.status === 'running') {
+      notify('info', 'Phase 1 完成，开始搜索 Apple Music');
+      setTimeout(() => runPhase(2), 500);
+    }
   } catch (e) {
+    notify('error', '❌ ' + e.message);
     showAuthError(e.message);
     document.querySelector('#auth-screen .btn').disabled = false;
     document.querySelector('#auth-screen .btn').textContent = '开始同步';
@@ -463,30 +480,54 @@ function errorView(s) {
 // ── Run a phase ──
 async function runPhase(phase) {
   const c = document.getElementById('content');
-  c.innerHTML = '<div class="loading"><div class="spinner"></div><span>处理中...</span></div>';
+  const phaseNames = { 1: '获取网易云日推', 2: '搜索 Apple Music', 3: '创建歌单', 4: '添加歌曲', 5: '清理旧歌单' };
+  c.innerHTML = '<div class="loading"><div class="spinner"></div><span>' + (phaseNames[phase] || '处理中') + '...</span></div>';
 
   try {
     let url = '/sync?phase=' + phase + '&session=' + SESSION;
     const s = await api(url);
     renderPhase(s);
 
-    // Auto-poll for batched Phase 2
+    // Phase 2 batch polling (always)
     if (s.phase === 2 && s.status === 'running') {
       setTimeout(() => runPhase(2), 500);
+      return;
     }
 
-    // Auto-chain phases 3→4→5
-    if (s.phase === 3 && s.status === 'running') {
-      setTimeout(() => runPhase(4), 300);
+    // Auto-chain: phases 3→4→5 always; phase 2→3 only in AUTO mode
+    if (s.status === 'running') {
+      const nextPhase = { 2: 3, 3: 4, 4: 5 };
+      const next = nextPhase[s.phase];
+      if (next) {
+        // Only auto-advance from phase 2 in AUTO mode (non-auto goes to 2.5 for review)
+        if (s.phase === 2 && !AUTO) return;
+        notify('info', 'Phase ' + s.phase + ' 完成，继续 Phase ' + next);
+        setTimeout(() => runPhase(next), 300);
+      }
     }
-    if (s.phase === 4 && s.status === 'running') {
-      setTimeout(() => runPhase(5), 300);
+
+    // Completion notification
+    if (s.status === 'done') {
+      const found = (s.amResults || []).filter(r => r.status === 'found').length;
+      notify('success', '✅ 同步完成！' + found + '/' + s.ncmTotal + ' 首已同步');
     }
   } catch (e) {
+    notify('error', '❌ ' + e.message);
     c.innerHTML = errorView({ errors: [e.message] });
   }
 }
 
+// ── In-page notifications ──
+function notify(type, msg) {
+  const box = document.getElementById('notifications');
+  if (!box) return;
+  const time = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const div = document.createElement('div');
+  div.className = 'notify-item ' + type;
+  div.innerHTML = '<span class="notify-time">' + time + '</span><span>' + msg + '</span>';
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+}
 // ── Manual search ──
 async function doSearch(ncmId) {
   const input = document.getElementById('search-' + ncmId);
