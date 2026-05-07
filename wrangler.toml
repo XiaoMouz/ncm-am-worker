@@ -15,11 +15,24 @@ run_worker_first = ["/sync*", "/session*", "/status*", "/login*", "/subscribe*",
 crons = ["30 22 * * *"]  # 06:30 UTC+8 daily
 
 # ── KV namespace ──
-# 创建: wrangler kv namespace create NCM_AM
-# 把输出的 ID 填入下方
 [[kv_namespaces]]
 binding = "KV"
-id = "YOUR_KV_ID"
+id = "df71033b4214488791fb25de4729019f"
+
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = true
+persist = true
+head_sampling_rate = 1
 
 # ── Secrets (set via wrangler secret put) ──
 # NCM_COOKIE    — 网易云 cookie (MUSIC_U=xxx; __csrf=yyy)
