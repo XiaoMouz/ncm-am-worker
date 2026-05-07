@@ -166,6 +166,22 @@ async function getDeveloperToken(env: Env): Promise<string> {
   return createDeveloperToken(env.AM_TEAM_ID, env.AM_KEY_ID, env.AM_PRIVATE_KEY);
 }
 
+async function serveFrontendAsset(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const assetResponse = await env.ASSETS.fetch(request);
+  if (assetResponse.status !== 404) {
+    return assetResponse;
+  }
+
+  const isExtensionlessRoute = !url.pathname.split('/').pop()?.includes('.');
+  if (url.pathname === '/' || isExtensionlessRoute) {
+    const indexUrl = new URL('/index.html', url);
+    return env.ASSETS.fetch(new Request(indexUrl.toString(), request));
+  }
+
+  return assetResponse;
+}
+
 export default {
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil(runAutoSync(env));
@@ -414,6 +430,6 @@ export default {
       }
     }
 
-    return env.ASSETS.fetch(request);
+    return serveFrontendAsset(request, env);
   },
 };
