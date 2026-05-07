@@ -171,6 +171,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
     <input id="token-input" type="password" placeholder="输入 Sync Token" autofocus>
     <label><input id="auto-check" type="checkbox"> Automatic Skip Missing Songs</label>
     <button class="btn btn-primary" onclick="startSync()">开始同步</button>
+    <div id="resume-box" class="hidden" style="margin-top:12px">
+      <div style="font-size:13px;color:#888;margin-bottom:8px">发现未完成的会话</div>
+      <button class="btn btn-secondary" style="width:100%" onclick="resumeSession()">继续上次同步</button>
+    </div>
     <div id="auth-error" class="hidden" style="margin-top:12px;color:#ff6b6b;font-size:13px"></div>
   </div>
 </div>
@@ -511,20 +515,27 @@ async function doPushUnsubscribe() {
   if (loadAuth()) {
     document.getElementById('token-input').value = TOKEN;
     document.getElementById('auto-check').checked = AUTO;
-    showWizard();
-    notify('info', '恢复会话: ' + SESSION.slice(0,8) + '...');
-    api('/sync?phase=2&session=' + SESSION).then(s => {
-      renderPhase(s);
-      if (s.phase === 2 && s.status === 'running') setTimeout(() => runPhase(2), 500);
-    }).catch(() => {
-      localStorage.removeItem('ncm_am_session');
-      SESSION = '';
-      document.getElementById('auth-screen').classList.remove('hidden');
-      document.getElementById('wizard-screen').classList.add('hidden');
-      showAuthError('会话已过期，请重新开始');
-    });
+    // Show resume option on auth screen
+    document.getElementById('resume-box').classList.remove('hidden');
   }
 })();
+
+async function resumeSession() {
+  document.querySelector('#resume-box .btn').disabled = true;
+  document.querySelector('#resume-box .btn').textContent = '连接中...';
+  try {
+    const s = await api('/sync?phase=2&session=' + SESSION);
+    showWizard();
+    notify('info', '恢复会话: ' + SESSION.slice(0,8) + '...');
+    renderPhase(s);
+    if (s.phase === 2 && s.status === 'running') setTimeout(() => runPhase(2), 500);
+  } catch (e) {
+    localStorage.removeItem('ncm_am_session');
+    SESSION = '';
+    document.getElementById('resume-box').classList.add('hidden');
+    showAuthError('会话已过期: ' + e.message);
+  }
+}
 </script>
 </body>
 </html>`;
