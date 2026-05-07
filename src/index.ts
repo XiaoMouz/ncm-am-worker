@@ -17,7 +17,7 @@ import {
 import { checkLogin, refreshLoginRaw, qrLoginCreateKey, qrLoginUrl, qrLoginCheck } from './ncm';
 import { searchSongCandidates } from './apple-music';
 import { generateVapidKeys, sendPushNotification } from './web-push';
-import { SW_JS, frontendHtml, subscribeHtml } from './static';
+import { SW_JS, subscribeHtml } from './static';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -177,12 +177,6 @@ export default {
 
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: corsHeaders });
-    }
-
-    if (path === '/' || path === '/index.html') {
-      return new Response(frontendHtml(), {
-        headers: { 'Content-Type': 'text/html; charset=utf-8', ...corsHeaders },
-      });
     }
 
     if (path === '/sw.js') {
@@ -420,6 +414,6 @@ export default {
       }
     }
 
-    return json({ error: 'Not found' }, 404);
+    return env.ASSETS.fetch(request);
   },
 };

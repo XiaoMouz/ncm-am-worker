@@ -5,6 +5,7 @@ Cloudflare Worker: 网易云音乐每日推荐 → Apple Music 多阶段同步
 ## 功能
 
 - 网页驱动的 phase 1~5 同步流程：收集日推 → 搜索 Apple Music → 创建歌单 → 添加歌曲 → 清理旧歌单
+- 前端已迁移到 **React + Tailwind + shadcn/ui 风格组件 + lucide-react 图标**
 - phase 2 为每首未确认歌曲返回候选列表，支持重新搜索、手动点选、显式跳过
 - 单 active session 模型：新网页会话会替换旧会话；cron 遇到进行中的会话会跳过
 - 支持通过 `session` 恢复流程，读取状态不会重复执行 phase
@@ -46,6 +47,9 @@ Cloudflare Worker: 网易云音乐每日推荐 → Apple Music 多阶段同步
 ```bash
 cd ncm-am-worker && npm install
 
+# 构建 Worker 类型和前端资源
+npm run build
+
 # 创建 KV
 wrangler kv namespace create NCM_AM
 # 填入 wrangler.toml
@@ -56,7 +60,7 @@ wrangler secret put AM_DEVELOPER_TOKEN
 wrangler secret put AM_USER_TOKEN
 
 # 部署
-wrangler deploy
+npm run deploy
 ```
 
 ## 文件结构
@@ -70,9 +74,9 @@ src/
 ├── apple-music.ts   # Apple Music API
 ├── web-push.ts      # Web Push 实现 (VAPID + 加密)
 └── sync.ts          # 同步逻辑
-public/
-├── subscribe.html   # 订阅页面
-└── sw.js            # Service Worker
+web/
+├── index.html       # Vite 入口
+└── src/             # React UI (shadcn/ui 风格组件 + lucide-react)
 ```
 
 ## 环境变量 (可选)

@@ -1,5 +1,6 @@
 export interface Env {
   KV: KVNamespace;
+  ASSETS: Fetcher;
 
   NCM_COOKIE: string;
   AM_DEVELOPER_TOKEN?: string;
