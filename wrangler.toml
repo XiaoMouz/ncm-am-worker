@@ -1,15 +1,15 @@
 # wrangler.toml — ncm-am-worker
 name = "ncm-am-worker"
 main = "src/index.ts"
-compatibility_date = "2024-12-01"
-compatibility_flags = ["nodejs_compat"]
+compatibility_date = "2026-05-07"
 
 [build]
 command = "npm run build"
 
 [assets]
 directory = "./web-dist"
-binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = ["/sync*", "/session*", "/status*", "/login*", "/subscribe*", "/vapid-key*", "/search*", "/sw.js", "/__scheduled*"]
 
 [triggers]
 crons = ["30 22 * * *"]  # 06:30 UTC+8 daily

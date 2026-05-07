@@ -166,35 +166,9 @@ async function getDeveloperToken(env: Env): Promise<string> {
   return createDeveloperToken(env.AM_TEAM_ID, env.AM_KEY_ID, env.AM_PRIVATE_KEY);
 }
 
-async function serveFrontendAsset(request: Request, env: Env): Promise<Response> {
-  const url = new URL(request.url);
-  const shouldServeIndex =
-    url.pathname === '/' ||
-    url.pathname === '/index.html' ||
-    url.pathname.endsWith('.html') ||
-    !url.pathname.split('/').pop()?.includes('.');
-
-  if (shouldServeIndex) {
-    const indexUrl = new URL('/index.html', url);
-    return env.ASSETS.fetch(new Request(indexUrl.toString(), request));
-  }
-
-  const assetResponse = await env.ASSETS.fetch(request);
-  if (assetResponse.status !== 404) {
-    return assetResponse;
-  }
-
-  if (url.pathname.endsWith('.html')) {
-    const indexUrl = new URL('/index.html', url);
-    return env.ASSETS.fetch(new Request(indexUrl.toString(), request));
-  }
-
-  return assetResponse;
-}
-
 export default {
-  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(runAutoSync(env));
+  async scheduled(_controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
+    await runAutoSync(env);
   },
 
   async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
@@ -252,15 +226,19 @@ export default {
     }
 
     if (path === '/status' && request.method === 'GET') {
-      let cookie = env.NCM_COOKIE;
+      let cookie = env.NCM_COOKIE || '';
       const savedCookie = await env.KV.get('ncm_cookie');
       if (savedCookie) cookie = savedCookie;
 
       let ncm: { ok: boolean; uid?: string; nickname?: string; error?: string };
-      try {
-        ncm = await checkLogin(cookie);
-      } catch (error) {
-        ncm = { ok: false, error: (error as Error).message };
+      if (!cookie) {
+        ncm = { ok: false, error: 'NCM cookie is not configured' };
+      } else {
+        try {
+          ncm = await checkLogin(cookie);
+        } catch (error) {
+          ncm = { ok: false, error: (error as Error).message };
+        }
       }
 
       let refreshed = false;
@@ -440,6 +418,6 @@ export default {
       }
     }
 
-    return serveFrontendAsset(request, env);
+    return json({ error: 'Not found' }, 404);
   },
 };

@@ -13,8 +13,10 @@ export async function ncmRequest(
   data: Record<string, unknown>,
   cookie: string,
 ): Promise<any> {
+  const safeCookie = cookie || '';
+
   // Add csrf_token from cookie
-  const csrfMatch = cookie.match(/__csrf=([^;]+)/);
+  const csrfMatch = safeCookie.match(/__csrf=([^;]+)/);
   data.csrf_token = csrfMatch ? csrfMatch[1] : '';
 
   const encrypted = await weapiEncrypt(data);
@@ -34,7 +36,7 @@ export async function ncmRequest(
       'Content-Type': 'application/x-www-form-urlencoded',
       'User-Agent': UA,
       Referer: NCM_DOMAIN,
-      Cookie: cookie,
+      Cookie: safeCookie,
     },
     body: body.toString(),
   });

@@ -2,6 +2,13 @@
 
 Cloudflare Worker: 网易云音乐每日推荐 → Apple Music 多阶段同步
 
+## Worker 运行基线
+
+- **Wrangler v4**
+- **compatibility_date = 2026-05-07**
+- 使用 Workers Static Assets 的 **single-page-application** 路由模式提供前端
+- API / cron / push / KV session 仍由 Worker 脚本处理
+
 ## 功能
 
 - 网页驱动的 phase 1~5 同步流程：收集日推 → 搜索 Apple Music → 创建歌单 → 添加歌曲 → 清理旧歌单
@@ -51,17 +58,37 @@ cd ncm-am-worker && npm install
 npm run build
 
 # 创建 KV
-wrangler kv namespace create NCM_AM
+npx wrangler kv namespace create NCM_AM --remote
 # 填入 wrangler.toml
 
 # 设置 Secrets
-wrangler secret put NCM_COOKIE
-wrangler secret put AM_DEVELOPER_TOKEN
-wrangler secret put AM_USER_TOKEN
+npx wrangler secret put NCM_COOKIE
+npx wrangler secret put AM_DEVELOPER_TOKEN
+npx wrangler secret put AM_USER_TOKEN
 
 # 部署
 npm run deploy
 ```
+
+## 本地开发与验证
+
+```bash
+# Worker + 前端 assets（Wrangler v4 本地模式，包含 scheduled 测试入口）
+npm run dev
+
+# 类型检查 + 前端构建
+npm run build
+
+# 检查部署配置，不真正发布
+npx wrangler deploy --dry-run
+```
+
+说明：
+
+- 在 Wrangler v4 中，很多资源命令默认是 **local mode**，访问远端 KV / R2 时要显式带 `--remote`。
+- 前端由 `web-dist/` 提供，`wrangler.toml` 中通过 `assets.not_found_handling = "single-page-application"` 处理 SPA 路由。
+- Worker 只对 `/sync*`、`/session*`、`/status*`、`/login*`、`/subscribe*`、`/vapid-key*`、`/search*`、`/sw.js` 等运行时路径优先执行脚本。
+- 本地测试 cron 时，Wrangler v4 使用 `--test-scheduled`，入口是 `http://localhost:8787/__scheduled`。
 
 ## 文件结构
 
@@ -77,6 +104,7 @@ src/
 web/
 ├── index.html       # Vite 入口
 └── src/             # React UI (shadcn/ui 风格组件 + lucide-react)
+web-dist/            # 前端构建产物（Workers Static Assets）
 ```
 
 ## 环境变量 (可选)

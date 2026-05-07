@@ -49,7 +49,17 @@ function getAccountLabel(env: Env): string {
   if (env.AM_ACCOUNT_LABEL?.trim()) {
     return env.AM_ACCOUNT_LABEL.trim();
   }
-  return `Music User Token ${maskUserToken(env.AM_USER_TOKEN)}`;
+  if (env.AM_USER_TOKEN?.trim()) {
+    return `Music User Token ${maskUserToken(env.AM_USER_TOKEN)}`;
+  }
+  return 'Apple Music user token not configured';
+}
+
+function getMusicUserToken(env: Env): string {
+  if (env.AM_USER_TOKEN?.trim()) {
+    return env.AM_USER_TOKEN.trim();
+  }
+  throw new Error('Apple Music user token is not configured');
 }
 
 function createIssue(input: Omit<SyncIssue, 'id' | 'createdAt'>): SyncIssue {
@@ -713,12 +723,13 @@ export async function phase3(env: Env, session: SyncSession): Promise<SyncSessio
 
   try {
     const developerToken = await getDeveloperToken(env);
-    const playlists = await listPlaylists(developerToken, env.AM_USER_TOKEN);
+    const userToken = getMusicUserToken(env);
+    const playlists = await listPlaylists(developerToken, userToken);
     const existing = playlists.find((playlist) => playlist.name === session.playlistName);
 
     session.playlistId = existing
       ? existing.id
-      : await createPlaylist(session.playlistName, developerToken, env.AM_USER_TOKEN);
+      : await createPlaylist(session.playlistName, developerToken, userToken);
     session.phase = 4;
     session.state = 'adding_tracks';
     await saveSession(env, session);
@@ -739,13 +750,14 @@ export async function phase4(env: Env, session: SyncSession): Promise<SyncSessio
 
   try {
     const developerToken = await getDeveloperToken(env);
+    const userToken = getMusicUserToken(env);
     const foundIds = session.songMatches
       .filter((song) => song.status === 'matched' && song.selectedCandidate?.id)
       .map((song) => song.selectedCandidate!.id);
 
     session.addedCount = foundIds.length;
     if (foundIds.length > 0) {
-      await addSongsToPlaylist(session.playlistId, foundIds, developerToken, env.AM_USER_TOKEN);
+      await addSongsToPlaylist(session.playlistId, foundIds, developerToken, userToken);
     }
 
     session.phase = 5;
@@ -765,7 +777,8 @@ export async function phase5(env: Env, session: SyncSession): Promise<SyncSessio
 
   try {
     const developerToken = await getDeveloperToken(env);
-    const playlists = await listPlaylists(developerToken, env.AM_USER_TOKEN);
+    const userToken = getMusicUserToken(env);
+    const playlists = await listPlaylists(developerToken, userToken);
     const keepDays = parseInt(env.KEEP_DAYS || String(KEEP_DAYS_DEFAULT), 10);
     const prefix = env.PLAYLIST_PREFIX || PLAYLIST_PREFIX_DEFAULT;
 
@@ -777,7 +790,7 @@ export async function phase5(env: Env, session: SyncSession): Promise<SyncSessio
       if (!playlist.name.startsWith(prefix)) continue;
       const playlistDate = playlist.name.slice(prefix.length);
       if (!/^\d{4}-\d{2}-\d{2}$/.test(playlistDate) || playlistDate >= cutoff) continue;
-      await deletePlaylist(playlist.id, developerToken, env.AM_USER_TOKEN);
+      await deletePlaylist(playlist.id, developerToken, userToken);
       session.deletedPlaylists.push(playlist.name);
     }
 
