@@ -8,6 +8,7 @@ import {
   qrLoginCheck,
 } from './ncm';
 import { generateVapidKeys, sendPushNotification } from './web-push';
+import { SW_JS, subscribeHtml } from './static';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -124,17 +125,14 @@ export default {
     // ── GET /subscribe ── (serve HTML page)
     if (path === '/subscribe' && request.method === 'GET') {
       const vapidKeys = await getVapidKeys(env);
-      let html = await fetch(new URL('../public/subscribe.html', import.meta.url).toString()).then(r => r.text());
-      html = html.replace('{{VAPID_PUBLIC_KEY}}', vapidKeys.publicKey);
-      return new Response(html, {
+      return new Response(subscribeHtml(vapidKeys.publicKey), {
         headers: { 'Content-Type': 'text/html; charset=utf-8', ...corsHeaders },
       });
     }
 
     // ── GET /sw.js ── (service worker)
     if (path === '/sw.js') {
-      const sw = await fetch(new URL('../public/sw.js', import.meta.url).toString()).then(r => r.text());
-      return new Response(sw, {
+      return new Response(SW_JS, {
         headers: { 'Content-Type': 'application/javascript', ...corsHeaders },
       });
     }
@@ -283,7 +281,7 @@ export default {
     }
 
     // ── POST /sync ──
-    if (path === '/sync' && request.method === 'POST') {
+    if (path === '/sync') {
       try {
         const result = await sync(env);
         const text = formatResult(result);
