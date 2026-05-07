@@ -100,6 +100,32 @@ function summarizeSession(session: SyncSession): { found: number; total: number 
   return { found, total: session.ncmTotal };
 }
 
+async function notifyManualSyncOutcome(env: Env, session: SyncSession): Promise<void> {
+  if (session.source !== 'manual') return;
+
+  const summary = summarizeSession(session);
+  if (session.status === 'done') {
+    await notifySubscribers(
+      env,
+      '🎵 同步完成',
+      `${session.date}: ${summary.found}/${summary.total} 首已同步到 Apple Music`,
+      'success',
+      session.id,
+    );
+    return;
+  }
+
+  if (session.status === 'error') {
+    await notifySubscribers(
+      env,
+      '⚠️ 同步异常',
+      session.issues.at(-1)?.message || 'Unknown sync error',
+      'error',
+      session.id,
+    );
+  }
+}
+
 async function runAutoSync(env: Env): Promise<void> {
   const session = await startCronSession(env);
   if (!session) {
@@ -334,6 +360,7 @@ export default {
         if (!phase) {
           const session = await startManualSession(env, auto);
           const result = await phase1(env, session);
+          await notifyManualSyncOutcome(env, result);
           return json(await getSessionResponse(env, result.id));
         }
 
@@ -390,26 +417,7 @@ export default {
             return json({ error: `Unknown phase: ${phase}` }, 400);
         }
 
-        if (phase === '5') {
-          const summary = summarizeSession(updated);
-          if (updated.status === 'done') {
-            await notifySubscribers(
-              env,
-              '🎵 同步完成',
-              `${updated.date}: ${summary.found}/${summary.total} 首已同步到 Apple Music`,
-              'success',
-              updated.id,
-            );
-          } else if (updated.status === 'error') {
-            await notifySubscribers(
-              env,
-              '⚠️ 同步异常',
-              updated.issues.at(-1)?.message || 'Unknown sync error',
-              'error',
-              updated.id,
-            );
-          }
-        }
+        await notifyManualSyncOutcome(env, updated);
 
         return json(await getSessionResponse(env, updated.id));
       } catch (error) {
